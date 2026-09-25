@@ -240,3 +240,64 @@ h3 {
   font-size: 0.95rem;
   margin-bottom: 0.4rem;
 }
+
+/* ---------------------------------------------------------- 行程受限审计 */
+.audit {
+  margin-top: 1.1rem;
+  border: 1px solid var(--panel-border);
+  border-left: 3px solid var(--accent);
+  border-radius: 8px;
+  padding: 0.8rem 1rem;
+  background: #0d131b;
+}
+
+.audit-grid input.bound-input {
+  width: 8.5rem;
+  padding: 0.35rem 0.5rem;
+  font-size: 0.85rem;
+}
+
+.audit-status {
+  min-height: 1.2rem;
+  margin: 0.5rem 0 0;
+  font-size: 0.85rem;
+}
+
+.audit-status[data-kind="ok"] { color: var(--ok); }
+.audit-status[data-kind="warn"] { color: var(--warn); }
+.audit-status[data-kind="error"] { color: var(--bad); }
+.audit-status[data-kind="busy"] { color: var(--accent); }
+
+.audit-result {
+  margin-top: 0.7rem;
+}
+
+.audit-ok,
+.audit-blocked,
+.audit-error {
+  border: 1px solid var(--panel-border);
+  border-radius: 8px;
+  padding: 0.6rem 0.9rem;
+  background: var(--panel);
+}
+
+.audit-blocked {
+  border-color: var(--warn);
+}
+
+.audit-error {
+  border-color: var(--bad);
+}
+
+.ok-text { color: var(--ok); }
+.bad-text { color: var(--bad); }
+
+.audit-items td,
+.audit-items th {
+  font-size: 0.82rem;
+}
+
+h4 {
+  font-size: 0.9rem;
+  margin: 0.8rem 0 0.3rem;
+}

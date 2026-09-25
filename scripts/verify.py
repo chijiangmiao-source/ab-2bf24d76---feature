@@ -180,6 +180,93 @@ def step3_http_smoke() -> None:
           f"status={status} body={body!r}"[:300])
 
 
+def step4_travel_audit_smoke() -> None:
+    print("\n== 步骤 4：行程受限审计冒烟 ==", flush=True)
+
+    # 1) Global optimum: p=[5,0], bounds [0,4]^2 -> [4,1], offsets [-1,1], L1=2.
+    status, raw = http(
+        "POST", f"{APP_BASE_URL}/api/audit",
+        {
+            "variables": ["K1", "K2"],
+            "matrix": [["1", "1"]],
+            "target": ["5"],
+            "bounds": [["0", "4"], ["0", "4"]],
+        },
+    )
+    body = json.loads(raw) if raw else None
+    check("可行程审计返回 HTTP 200", status == 200, f"status={status}")
+    check("审计判定可行", bool(body) and body.get("feasible") is True)
+    check("全局最优调整为 [4, 1]", bool(body) and body.get("adjusted") == ["4", "1"])
+    check("偏移向量为 [-1, 1]", bool(body) and body.get("offsets") == ["-1", "1"])
+    check("总绝对偏移为 2", bool(body) and body.get("totalAbsOffset") == "2")
+    constraints = (body or {}).get("constraints") or []
+    check("调整后每条约束精确复算成立",
+          bool(constraints) and all(c["satisfied"] for c in constraints))
+    items = (body or {}).get("items") or []
+    check("逐项在界判定全部为真",
+          bool(items) and all(i["within"] for i in items))
+
+    # 2) Solvable equation, no integer point inside the travel.
+    status, raw = http(
+        "POST", f"{APP_BASE_URL}/api/audit",
+        {
+            "variables": ["K1", "K2"],
+            "matrix": [["1", "1"]],
+            "target": ["5"],
+            "bounds": [["0", "1"], ["0", "1"]],
+        },
+    )
+    body = json.loads(raw) if raw else None
+    check("行程内无整数点返回 200 且 feasible=false",
+          status == 200 and bool(body) and body.get("feasible") is False
+          and body.get("reason") == "no_bounded_solution")
+    check("无可行点时保留原始特解结论",
+          bool(body) and body.get("solution") == ["5", "0"])
+
+    # 3) Illegal bounds: min above max -> 400.
+    status, raw = http(
+        "POST", f"{APP_BASE_URL}/api/audit",
+        {
+            "variables": ["K1", "K2"],
+            "matrix": [["1", "1"]],
+            "target": ["5"],
+            "bounds": [["9", "4"], None],
+        },
+    )
+    body = json.loads(raw) if raw else None
+    check("最小垫片数大于最大垫片数返回 HTTP 400",
+          status == 400 and bool(body) and body.get("ok") is False)
+
+    # 4) Bounds do not span the free direction -> 422.
+    status, raw = http(
+        "POST", f"{APP_BASE_URL}/api/audit",
+        {
+            "variables": ["K1", "K2", "K3"],
+            "matrix": [["1", "1", "1"]],
+            "target": ["100"],
+            "bounds": [["0", "5"], None, None],
+        },
+    )
+    body = json.loads(raw) if raw else None
+    check("边界不足以限定自由方向返回 HTTP 422",
+          status == 422 and bool(body) and body.get("ok") is False)
+
+    # 5) Equation itself unsolvable: obstruction is preserved through audit.
+    status, raw = http(
+        "POST", f"{APP_BASE_URL}/api/audit",
+        {
+            "variables": ["D1", "D2"],
+            "matrix": [["2", "0"], ["0", "2"]],
+            "target": ["9007199254740993", "4"],
+            "bounds": [["0", "100"], ["0", "100"]],
+        },
+    )
+    body = json.loads(raw) if raw else None
+    check("方程无解时审计返回 equation_unsolvable 且保留障碍",
+          status == 200 and bool(body) and body.get("solvable") is False
+          and (body.get("obstruction") or {}).get("type") == "non_divisible")
+
+
 def main() -> int:
     print(f"验收目标：{APP_BASE_URL}", flush=True)
     if not wait_for_app():
@@ -189,6 +276,7 @@ def main() -> int:
         step1_obstruction_evidence()
         step2_tests_and_build_checks()
         step3_http_smoke()
+        step4_travel_audit_smoke()
 
     print("\n== 验收结论 ==", flush=True)
     if failures:

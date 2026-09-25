@@ -24,7 +24,8 @@ const resultPanel = $("result-panel");
 const resultBox = $("result");
 
 let generation = 0; // 草稿/请求世代号
-let inflight = null; // 在途请求的 AbortController
+let inflight = null; // 在途请求（复核或审计）的 AbortController
+let lastPayload = null; // 最近一次成功复核的精确草稿（变量/矩阵/目标）
 
 const INT_PATTERN = /^[+-]?\d+$/;
 
@@ -137,6 +138,7 @@ async function runReview() {
   if (inflight) {
     inflight.abort();
   }
+  lastPayload = payload;
   const controller = new AbortController();
   inflight = controller;
   cancelButton.disabled = false;
@@ -288,6 +290,8 @@ function renderSolution(data) {
     details.appendChild(table);
     resultBox.appendChild(details);
   }
+
+  resultBox.appendChild(buildAuditSection(data));
 }
 
 function renderConstraintDetail(parent, constraint) {
@@ -316,6 +320,393 @@ function renderConstraintDetail(parent, constraint) {
       constraint.satisfied ? "左侧和与目标值精确相等 ✓" : "左侧和与目标值不相等 ✗"
     )
   );
+}
+
+// ------------------------------------------------------------ 行程受限审计
+
+function buildAuditSection(data) {
+  const section = el("section", "audit");
+  section.appendChild(
+    el("h3", null, "行程受限审计（装配边界下的全局最优整数方案）")
+  );
+  section.appendChild(
+    el(
+      "p",
+      "hint",
+      "为每个机械校正项填写最小/最大垫片数（任一可空，留空表示该侧不限）。" +
+        "审计从当前精确特解与齐次整数解格出发，在边界整数格点中全局枚举，" +
+        "返回相对当前校正量总绝对偏移最小的一组；并列时按变量标识顺序的偏移" +
+        "向量字典序裁决，绝不将连续解取整或沿单个自由方向贪心。"
+    )
+  );
+
+  const grid = el("table", "num audit-grid");
+  const head = el("tr");
+  ["校正项", "当前精确校正量", "最小垫片数", "最大垫片数"].forEach((title) =>
+    head.appendChild(el("th", null, title))
+  );
+  grid.appendChild(head);
+  const minInputs = [];
+  const maxInputs = [];
+  data.variables.forEach((name, j) => {
+    const row = el("tr");
+    row.appendChild(el("td", null, name));
+    row.appendChild(el("td", null, data.solution[j]));
+    const minInput = el("input");
+    minInput.type = "text";
+    minInput.spellcheck = false;
+    minInput.autocomplete = "off";
+    minInput.className = "bound-input num";
+    minInput.placeholder = "不限";
+    const maxInput = el("input");
+    maxInput.type = "text";
+    maxInput.spellcheck = false;
+    maxInput.autocomplete = "off";
+    maxInput.className = "bound-input num";
+    maxInput.placeholder = "不限";
+    const minCell = el("td");
+    const maxCell = el("td");
+    minCell.appendChild(minInput);
+    maxCell.appendChild(maxInput);
+    row.appendChild(minCell);
+    row.appendChild(maxCell);
+    grid.appendChild(row);
+    minInputs.push(minInput);
+    maxInputs.push(maxInput);
+  });
+  section.appendChild(grid);
+
+  const actions = el("div", "actions");
+  const runAuditButton = el("button", "primary", "发起行程受限审计");
+  runAuditButton.type = "button";
+  const clearAuditButton = el("button", "ghost", "清空边界 / 取消审计");
+  actions.appendChild(runAuditButton);
+  actions.appendChild(clearAuditButton);
+  section.appendChild(actions);
+
+  const auditStatus = el("p", "audit-status");
+  auditStatus.setAttribute("role", "status");
+  section.appendChild(auditStatus);
+  const auditResult = el("div", "audit-result");
+  section.appendChild(auditResult);
+
+  function setAuditStatus(message, kind) {
+    auditStatus.textContent = message;
+    auditStatus.dataset.kind = kind || "";
+  }
+
+  function collectBounds() {
+    const bounds = [];
+    for (let j = 0; j < data.variables.length; j += 1) {
+      const minText = minInputs[j].value.trim();
+      const maxText = maxInputs[j].value.trim();
+      if (!minText && !maxText) {
+        bounds.push(null);
+        continue;
+      }
+      if (minText && !INT_PATTERN.test(minText)) {
+        throw new Error(
+          `${data.variables[j]} 的最小垫片数“${minText}”不是十进制整数；边界格式非法。`
+        );
+      }
+      if (maxText && !INT_PATTERN.test(maxText)) {
+        throw new Error(
+          `${data.variables[j]} 的最大垫片数“${maxText}”不是十进制整数；边界格式非法。`
+        );
+      }
+      // Exact decimal-text comparison on normalised text (strip a sign and
+      // leading zeros), never via Number.
+      const minNorm = minText ? normalizeIntegerText(minText) : null;
+      const maxNorm = maxText ? normalizeIntegerText(maxText) : null;
+      if (minNorm && maxNorm && compareDecimalText(minNorm, maxNorm) > 0) {
+        throw new Error(
+          `${data.variables[j]} 的最小垫片数 ${minNorm} 大于最大垫片数 ${maxNorm}；边界格式非法。`
+        );
+      }
+      bounds.push([minNorm, maxNorm]);
+    }
+    return bounds;
+  }
+
+  function clearAuditOutcome() {
+    auditResult.replaceChildren();
+  }
+
+  async function runAudit() {
+    let bounds;
+    try {
+      bounds = collectBounds();
+    } catch (error) {
+      setAuditStatus(error.message, "error");
+      return;
+    }
+    if (!lastPayload) {
+      setAuditStatus("当前没有可复核的原始结论，请先发起复核。", "error");
+      return;
+    }
+    if (resultPanel.dataset.state === "stale") {
+      setAuditStatus("草稿已修改，请先重新发起复核，再针对最新的可解结论发起审计。", "error");
+      return;
+    }
+    const myGeneration = ++generation;
+    if (inflight) {
+      inflight.abort();
+    }
+    const controller = new AbortController();
+    inflight = controller;
+    runAuditButton.disabled = true;
+    clearAuditButton.disabled = false;
+    clearAuditOutcome();
+    setAuditStatus("行程受限审计枚举中（精确整数，全局最优）……", "busy");
+    try {
+      const response = await fetch("/api/audit", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ ...lastPayload, bounds }),
+        signal: controller.signal,
+      });
+      const reply = await response.json().catch(() => null);
+      if (myGeneration !== generation) {
+        return; // 草稿变更、重新复核或取消：丢弃过期审计返回
+      }
+      if (!response.ok || !reply || reply.ok !== true) {
+        const message = reply && reply.error ? reply.error : `HTTP ${response.status}`;
+        renderAuditError(auditResult, message, response.status);
+        setAuditStatus(`审计未完成：${message}`, "error");
+        return;
+      }
+      renderAuditResult(auditResult, reply);
+      setAuditStatus(
+        reply.feasible
+          ? "行程受限审计完成：已返回全局最优整数调整方案。"
+          : "行程受限审计完成：行程内无满足全部边界的整数方案。",
+        reply.feasible ? "ok" : "warn"
+      );
+    } catch (error) {
+      if (error && error.name === "AbortError") {
+        return;
+      }
+      if (myGeneration !== generation) {
+        return;
+      }
+      setAuditStatus(`审计请求失败：${error.message || error}`, "error");
+    } finally {
+      if (myGeneration === generation) {
+        inflight = null;
+        runAuditButton.disabled = false;
+      }
+    }
+  }
+
+  runAuditButton.addEventListener("click", runAudit);
+  clearAuditButton.addEventListener("click", () => {
+    generation += 1;
+    if (inflight) {
+      inflight.abort();
+      inflight = null;
+    }
+    runAuditButton.disabled = false;
+    minInputs.forEach((input) => {
+      input.value = "";
+    });
+    maxInputs.forEach((input) => {
+      input.value = "";
+    });
+    clearAuditOutcome();
+    setAuditStatus("已清空边界并取消审计：原始可复核结论保持不变。", "");
+  });
+  // Editing bounds invalidates any in-flight audit and raises the
+  // generation so a late reply can never overwrite the current draft; the
+  // reviewed original conclusion above stays fresh and untouched.
+  function invalidateAudit() {
+    generation += 1;
+    if (inflight) {
+      inflight.abort();
+      inflight = null;
+    }
+    runAuditButton.disabled = false;
+    clearAuditOutcome();
+    setAuditStatus("边界已修改：先前审计即使返回也将被丢弃，原始复核结论保持不变。", "warn");
+  }
+
+  [...minInputs, ...maxInputs].forEach((input) =>
+    input.addEventListener("input", invalidateAudit)
+  );
+
+  setAuditStatus("可填写边界后发起行程受限审计；不填边界不影响上方既有复核。", "");
+  return section;
+}
+
+function renderAuditError(parent, message, status) {
+  parent.replaceChildren();
+  const box = el("div", "audit-error");
+  let title = "审计请求被拒绝（边界或载荷格式非法）";
+  if (status === 422) {
+    title = message.includes("枚举") || message.includes("节点")
+      ? "行程整数格点枚举超过安全上限"
+      : "边界不足以限定全部自由校正方向（请求未被受理）";
+  }
+  box.appendChild(el("p", "verdict bad", title));
+  box.appendChild(el("p", "explanation", message));
+  box.appendChild(
+    el(
+      "p",
+      "hint",
+      "上方原始方程的精确复核结论仍然保留，可继续查看每项乘积与单约束复算。"
+    )
+  );
+  parent.appendChild(box);
+}
+
+function renderAuditResult(parent, data) {
+  parent.replaceChildren();
+
+  if (!data.solvable) {
+    const box = el("div", "audit-blocked");
+    box.appendChild(
+      el("p", "verdict bad", "原因：原始方程本身无整数解，行程边界无从审计。")
+    );
+    const ob = data.obstruction;
+    box.appendChild(
+      el(
+        "p",
+        "num explanation",
+        `规范除尽障碍（${ob.type === "non_divisible" ? "主元除尽失败" : "零行目标非零"}）：` +
+          `变换后第 ${ob.row + 1} 行主元 ${ob.pivot}，变换后目标 ${ob.transformedTarget}` +
+          `，余数 ${ob.remainder}。原始无解证据见上方结论，未被覆盖。`
+      )
+    );
+    parent.appendChild(box);
+    return;
+  }
+
+  if (!data.feasible) {
+    const box = el("div", "audit-blocked");
+    box.appendChild(
+      el(
+        "p",
+        "verdict bad",
+        "原因：原始方程可解，但装配行程内不存在满足全部耦合位移的整数方案。"
+      )
+    );
+    box.appendChild(
+      el(
+        "p",
+        "explanation",
+        "已在由特解与齐次整数解格给出的全部边界整数格点上完成精确枚举" +
+          `（枚举节点 ${data.nodes}），未找到同时满足原始方程与全部边界的点；` +
+          "这不是连续解取整失败，也不是沿单个自由方向贪心受限。"
+      )
+    );
+    const table = el("table", "num");
+    const head = el("tr");
+    ["校正项", "当前精确校正量", "最小垫片数", "最大垫片数", "当前是否在行程内"].forEach(
+      (title) => head.appendChild(el("th", null, title))
+    );
+    table.appendChild(head);
+    data.items.forEach((item) => {
+      const row = el("tr");
+      row.appendChild(el("td", null, item.variable));
+      row.appendChild(el("td", null, item.current));
+      row.appendChild(el("td", null, item.min === null ? "不限" : item.min));
+      row.appendChild(el("td", null, item.max === null ? "不限" : item.max));
+      row.appendChild(
+        el("td", item.within ? "ok-text" : "bad-text", item.within ? "在界内" : "越界")
+      );
+      table.appendChild(row);
+    });
+    box.appendChild(table);
+    box.appendChild(
+      el("p", "hint", "当前精确校正量、齐次解格与 Smith 摘要等原始复核结论均保留在上方。")
+    );
+    parent.appendChild(box);
+    return;
+  }
+
+  const box = el("div", "audit-ok");
+  box.appendChild(
+    el(
+      "p",
+      "verdict ok",
+      "审计结论：原始方程与全部边界同时成立，以下为总绝对偏移最小的全局最优整数调整。"
+    )
+  );
+  box.appendChild(
+    el(
+      "p",
+      "num explanation",
+      `目标 = Σ |调整量 − 当前精确校正量| = ${data.totalAbsOffset}` +
+        `（在有界整数解格上经完备枚举证明最优，枚举节点 ${data.nodes}）。`
+    )
+  );
+
+  const table = el("table", "num audit-items");
+  const head = el("tr");
+  [
+    "校正项",
+    "边界（最小 ~ 最大）",
+    "当前精确校正量",
+    "调整后校正量",
+    "偏移（带符号）",
+    "|偏移|",
+    "是否在界内",
+  ].forEach((title) => head.appendChild(el("th", null, title)));
+  table.appendChild(head);
+  data.items.forEach((item) => {
+    const row = el("tr");
+    const boundText =
+      item.min === null && item.max === null
+        ? "不限"
+        : `${item.min === null ? "-∞" : item.min} ~ ${item.max === null ? "+∞" : item.max}`;
+    row.appendChild(el("td", null, item.variable));
+    row.appendChild(el("td", null, boundText));
+    row.appendChild(el("td", null, item.current));
+    row.appendChild(el("td", null, item.adjusted));
+    row.appendChild(el("td", null, item.offset));
+    row.appendChild(el("td", null, item.absOffset));
+    row.appendChild(
+      el("td", item.within ? "ok-text" : "bad-text", item.within ? "在界内 ✓" : "越界 ✗")
+    );
+    table.appendChild(row);
+  });
+  box.appendChild(table);
+  box.appendChild(
+    el(
+      "p",
+      "num",
+      `调整后向量 [${data.adjusted.join(", ")}]，偏移向量 [${data.offsets.join(", ")}]` +
+        "（并列时按变量标识顺序的偏移向量字典序稳定裁决）。"
+    )
+  );
+
+  box.appendChild(el("h4", null, "每条原始约束在调整后方案上的精确复算"));
+  const listBox = el("div", "constraint-list");
+  const detail = el("div", "constraint-detail");
+  data.constraints.forEach((constraint, idx) => {
+    const button = el(
+      "button",
+      "constraint-item num",
+      `约束 ${idx + 1}：左侧和 ${constraint.sum} ＝ 目标 ${constraint.target} ${
+        constraint.satisfied ? "✓" : "✗"
+      }`
+    );
+    button.type = "button";
+    button.addEventListener("click", () => {
+      listBox
+        .querySelectorAll(".constraint-item")
+        .forEach((node) => node.classList.remove("active"));
+      button.classList.add("active");
+      renderConstraintDetail(detail, constraint);
+    });
+    listBox.appendChild(button);
+  });
+  box.appendChild(listBox);
+  box.appendChild(detail);
+  const first = listBox.querySelector(".constraint-item");
+  if (first) {
+    first.click();
+  }
+  parent.appendChild(box);
 }
 
 function renderObstruction(data) {
