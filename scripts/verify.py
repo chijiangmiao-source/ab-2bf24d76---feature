@@ -6,6 +6,9 @@ Order of checks (mirrors the acceptance contract):
      the review API (with a target beyond the IEEE-754 safe-integer range).
   2. Run the code test-suite and the build checks.
   3. HTTP smoke-test the health path and the review endpoint.
+  4. Exercise the travel-limited audit: bounded global optimum with exact
+     per-constraint recomputation, the solvable-but-infeasible and
+     equation-unsolvable cases, and illegal-bounds rejection.
 The process exit code reports the overall result: 0 = pass, 1 = fail.
 """
 
@@ -180,6 +183,110 @@ def step3_http_smoke() -> None:
           f"status={status} body={body!r}"[:300])
 
 
+def post_audit(payload) -> tuple[int, dict | None]:
+    status, text = http("POST", f"{APP_BASE_URL}/api/audit", payload)
+    try:
+        return status, json.loads(text)
+    except json.JSONDecodeError:
+        return status, None
+
+
+def step4_travel_limited_audit() -> None:
+    print("\n== 步骤 4：行程受限审计（有界整数解格上的全局最优） ==", flush=True)
+
+    # 2*K1 + 3*K2 = 1；特解 (-1,1)，齐次方向 (3,-2)。
+    # 边界 K1∈[0,4]、K2∈[-3,0] 内最近点为 (2,-1)，总绝对偏移 5。
+    status, body = post_audit(
+        {
+            "variables": ["K1", "K2"],
+            "matrix": [["2", "3"]],
+            "target": ["1"],
+            "bounds": [
+                {"variable": "K1", "min": "0", "max": "4"},
+                {"variable": "K2", "min": "-3", "max": "0"},
+            ],
+        }
+    )
+    check("行程审计（最优）返回 HTTP 200", status == 200, f"status={status}")
+    audit = (body or {}).get("audit") or {}
+    check("审计状态为 optimal", audit.get("status") == "optimal",
+          f"audit={audit!r}"[:300])
+    check("最优调整精确为 [2, -1]", audit.get("adjustment") == ["2", "-1"])
+    check("相对当前特解的偏移为 [3, -2]", audit.get("deviation") == ["3", "-2"])
+    check("总绝对偏移为 5", audit.get("totalAbsDeviation") == "5")
+    audit_constraints = audit.get("constraints") or []
+    check("调整后每条约束精确复算且满足",
+          bool(audit_constraints) and all(c["satisfied"] for c in audit_constraints))
+    check("调整后各项乘积精确为 [4, -3]",
+          [t["product"] for t in audit_constraints[0]["terms"]] == ["4", "-3"])
+    # 原始复核结论必须原样保留
+    check("审计响应保留可复核的原始结论（特解与约束）",
+          bool(body) and body.get("solution") == ["-1", "1"]
+          and all(c["satisfied"] for c in body.get("constraints", [])))
+
+    # 可解但行程内无整数解
+    status, body = post_audit(
+        {
+            "variables": ["K1", "K2"],
+            "matrix": [["2", "3"]],
+            "target": ["1"],
+            "bounds": [
+                {"variable": "K1", "min": "0", "max": "2"},
+                {"variable": "K2", "min": "0", "max": "2"},
+            ],
+        }
+    )
+    check("行程内无整数解返回 HTTP 200", status == 200, f"status={status}")
+    check("审计状态为 infeasible 且复核仍判可解",
+          bool(body) and body.get("audit", {}).get("status") == "infeasible"
+          and body.get("solvable") is True,
+          f"body={body!r}"[:300])
+
+    # 方程本身无解
+    status, body = post_audit(
+        {
+            "variables": ["D1", "D2"],
+            "matrix": [["2", "0"], ["0", "4"]],
+            "target": ["9007199254740993", "8"],
+            "bounds": [
+                {"variable": "D1", "min": "0", "max": "10"},
+                {"variable": "D2", "min": "0", "max": "10"},
+            ],
+        }
+    )
+    check("无解方程的审计状态为 unsolvable 且附规范除尽障碍",
+          status == 200 and bool(body)
+          and body.get("audit", {}).get("status") == "unsolvable"
+          and (body.get("obstruction") or {}).get("type") == "non_divisible")
+
+    # 边界格式非法 -> HTTP 400
+    status, body = post_audit(
+        {
+            "variables": ["K1", "K2"],
+            "matrix": [["2", "3"]],
+            "target": ["1"],
+            "bounds": [
+                {"variable": "K1", "min": "9", "max": "1"},
+                {"variable": "K2", "min": "0", "max": "2"},
+            ],
+        }
+    )
+    check("最小垫片数大于最大垫片数被拒绝（HTTP 400）",
+          status == 400 and bool(body) and body.get("ok") is False,
+          f"status={status} body={body!r}"[:300])
+
+    status, body = post_audit(
+        {
+            "variables": ["K1"],
+            "matrix": [["1"]],
+            "target": ["1"],
+            "bounds": [{"variable": "K9", "min": "0", "max": "2"}],
+        }
+    )
+    check("边界引用未知变量被拒绝（HTTP 400）",
+          status == 400 and bool(body) and body.get("ok") is False)
+
+
 def main() -> int:
     print(f"验收目标：{APP_BASE_URL}", flush=True)
     if not wait_for_app():
@@ -189,6 +296,7 @@ def main() -> int:
         step1_obstruction_evidence()
         step2_tests_and_build_checks()
         step3_http_smoke()
+        step4_travel_limited_audit()
 
     print("\n== 验收结论 ==", flush=True)
     if failures:

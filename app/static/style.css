@@ -240,3 +240,45 @@ h3 {
   font-size: 0.95rem;
   margin-bottom: 0.4rem;
 }
+
+h4 {
+  font-size: 0.9rem;
+  margin: 0.7rem 0 0.4rem;
+}
+
+.audit {
+  margin-top: 1rem;
+  border: 1px solid var(--panel-border);
+  border-left: 3px solid var(--accent);
+  border-radius: 8px;
+  padding: 0.8rem 1rem;
+  background: #101826;
+}
+
+.audit-bounds .bound-input {
+  width: 9rem;
+  padding: 0.35rem 0.5rem;
+}
+
+.audit-actions {
+  margin-top: 0.6rem;
+}
+
+.audit-status {
+  min-height: 1.3rem;
+  margin: 0.5rem 0 0;
+  font-size: 0.86rem;
+}
+
+.audit-status[data-kind="ok"] { color: var(--ok); }
+.audit-status[data-kind="warn"] { color: var(--warn); }
+.audit-status[data-kind="error"] { color: var(--bad); }
+.audit-status[data-kind="busy"] { color: var(--accent); }
+
+.audit-result.stale {
+  opacity: 0.45;
+}
+
+.audit-result table {
+  margin-top: 0.7rem;
+}

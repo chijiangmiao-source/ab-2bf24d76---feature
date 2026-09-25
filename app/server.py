@@ -1,9 +1,10 @@
 """HTTP front-end for the shim-correction review service.
 
-Serves the review page, a health endpoint and the exact Diophantine
-review API.  Standard library only; every integer is handled as an
-arbitrary-precision Python ``int`` and serialised as decimal text so
-values beyond the IEEE-754 safe-integer range stay exact end to end.
+Serves the review page, a health endpoint, the exact Diophantine review
+API and the travel-limited audit API.  Standard library only; every
+integer is handled as an arbitrary-precision Python ``int`` and
+serialised as decimal text so values beyond the IEEE-754 safe-integer
+range stay exact end to end.
 """
 
 from __future__ import annotations
@@ -22,6 +23,7 @@ from urllib.parse import urlsplit
 if hasattr(sys, "set_int_max_str_digits"):
     sys.set_int_max_str_digits(0)
 
+from app.bounded import optimize_within_bounds
 from app.diophantine import solve_diophantine
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -115,8 +117,75 @@ def parse_payload(data) -> tuple[list[str], list[list[int]], list[int]]:
     return variables, matrix, target
 
 
-def build_review_response(variables, matrix, target) -> dict:
-    result = solve_diophantine(matrix, target)
+def parse_bounds(data, variables) -> tuple[list[int], list[int]]:
+    """Parse per-variable shim-travel bounds for the travel-limited audit.
+
+    Every variable must appear exactly once with integer ``min``/``max``
+    and ``min <= max``; anything else is a client-side format error.
+    """
+    raw = data.get("bounds")
+    if not isinstance(raw, list) or not raw:
+        raise RequestError("bounds 必须是非空数组：为每个变量各给出一项 {variable, min, max}")
+    if len(raw) != len(variables):
+        raise RequestError(f"bounds 条目数 {len(raw)} 与变量数 {len(variables)} 不一致")
+    known = set(variables)
+    collected = {}
+    for index, entry in enumerate(raw):
+        where = f"bounds 第 {index + 1} 项"
+        if not isinstance(entry, dict):
+            raise RequestError(f"{where} 必须是对象（含 variable、min、max）")
+        name = entry.get("variable")
+        if not isinstance(name, str) or not name.strip():
+            raise RequestError(f"{where} 的变量标识为空或不是字符串")
+        name = name.strip()
+        if name not in known:
+            raise RequestError(f"{where} 引用了未知变量 “{name}”")
+        if name in collected:
+            raise RequestError(f"bounds 中变量 “{name}” 重复出现")
+        if "min" not in entry or "max" not in entry:
+            raise RequestError(f"变量 “{name}” 的边界必须同时给出 min 与 max")
+        lower = parse_integer(entry["min"], f"变量 “{name}” 的最小垫片数")
+        upper = parse_integer(entry["max"], f"变量 “{name}” 的最大垫片数")
+        if lower > upper:
+            raise RequestError(f"变量 “{name}” 的最小垫片数大于最大垫片数")
+        collected[name] = (lower, upper)
+    lower_bounds = [collected[name][0] for name in variables]
+    upper_bounds = [collected[name][1] for name in variables]
+    return lower_bounds, upper_bounds
+
+
+def build_constraints(variables, matrix, target, values) -> list[dict]:
+    """Exact per-constraint recomputation for a given correction vector."""
+    constraints = []
+    for i, row in enumerate(matrix):
+        terms = []
+        total = 0
+        for j, name in enumerate(variables):
+            product = row[j] * values[j]
+            total += product
+            terms.append(
+                {
+                    "variable": name,
+                    "coefficient": str(row[j]),
+                    "correction": str(values[j]),
+                    "product": str(product),
+                }
+            )
+        constraints.append(
+            {
+                "index": i,
+                "terms": terms,
+                "sum": str(total),
+                "target": str(target[i]),
+                "satisfied": total == target[i],
+            }
+        )
+    return constraints
+
+
+def build_review_response(variables, matrix, target, result=None) -> dict:
+    if result is None:
+        result = solve_diophantine(matrix, target)
     body = {
         "ok": True,
         "solvable": result.solvable,
@@ -128,33 +197,10 @@ def build_review_response(variables, matrix, target) -> dict:
         },
     }
     if result.solvable:
-        solution = result.solution
-        constraints = []
-        for i, row in enumerate(matrix):
-            terms = []
-            total = 0
-            for j, name in enumerate(variables):
-                product = row[j] * solution[j]
-                total += product
-                terms.append(
-                    {
-                        "variable": name,
-                        "coefficient": str(row[j]),
-                        "correction": str(solution[j]),
-                        "product": str(product),
-                    }
-                )
-            constraints.append(
-                {
-                    "index": i,
-                    "terms": terms,
-                    "sum": str(total),
-                    "target": str(target[i]),
-                    "satisfied": total == target[i],
-                }
-            )
-        body["solution"] = [str(value) for value in solution]
-        body["constraints"] = constraints
+        body["solution"] = [str(value) for value in result.solution]
+        body["constraints"] = build_constraints(
+            variables, matrix, target, result.solution
+        )
         body["homogeneousBasis"] = [
             [str(value) for value in vector] for vector in result.homogeneous_basis
         ]
@@ -179,6 +225,48 @@ def build_review_response(variables, matrix, target) -> dict:
             "uRow": [str(coefficient) for coefficient in obstruction.u_row],
             "uRowTerms": u_terms,
         }
+    return body
+
+
+def build_audit_response(variables, matrix, target, lower, upper) -> dict:
+    """Travel-limited audit on top of the exact review.
+
+    The review conclusion (solution + constraints, or the canonical
+    obstruction) is always included verbatim so the page keeps the
+    reviewable original result; the ``audit`` block then reports one of:
+
+    - ``unsolvable``: the equations themselves have no integer solution;
+    - ``infeasible``: solvable, but no integer solution inside the bounds;
+    - ``optimal``: the in-bounds adjustment minimising the total absolute
+      deviation from the current exact correction (ties adjudicated by
+      the deviation vector in variable order), with the exact
+      recomputation of every constraint.
+    """
+    result = solve_diophantine(matrix, target)
+    body = build_review_response(variables, matrix, target, result=result)
+    bounds_payload = [
+        {"variable": name, "min": str(lo), "max": str(hi)}
+        for name, lo, hi in zip(variables, lower, upper)
+    ]
+    if not result.solvable:
+        body["audit"] = {"status": "unsolvable", "bounds": bounds_payload}
+        return body
+    optimum = optimize_within_bounds(
+        result.solution, result.homogeneous_basis, lower, upper
+    )
+    if optimum is None:
+        body["audit"] = {"status": "infeasible", "bounds": bounds_payload}
+        return body
+    body["audit"] = {
+        "status": "optimal",
+        "bounds": bounds_payload,
+        "adjustment": [str(value) for value in optimum.adjustment],
+        "deviation": [str(value) for value in optimum.deviation],
+        "totalAbsDeviation": str(optimum.total_abs_deviation),
+        "constraints": build_constraints(
+            variables, matrix, target, optimum.adjustment
+        ),
+    }
     return body
 
 
@@ -222,7 +310,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:
         path = urlsplit(self.path).path
-        if path != "/api/review":
+        if path not in ("/api/review", "/api/audit"):
             self._send_json(404, {"ok": False, "error": "未知路径"})
             return
         try:
@@ -240,11 +328,17 @@ class Handler(BaseHTTPRequestHandler):
             return
         try:
             variables, matrix, target = parse_payload(data)
+            bounds = parse_bounds(data, variables) if path == "/api/audit" else None
         except RequestError as exc:
             self._send_json(400, {"ok": False, "error": str(exc)})
             return
         try:
-            self._send_json(200, build_review_response(variables, matrix, target))
+            if bounds is not None:
+                lower, upper = bounds
+                response = build_audit_response(variables, matrix, target, lower, upper)
+            else:
+                response = build_review_response(variables, matrix, target)
+            self._send_json(200, response)
         except Exception as exc:  # pragma: no cover - defensive
             self._send_json(500, {"ok": False, "error": f"服务器内部错误：{exc}"})
 
